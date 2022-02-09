@@ -1,0 +1,247 @@
+#!/bin/sh
+#
+# Copyright (c) 2022-2022, Muktadiur Rahman <muktadiur@gmail.com>
+# All rights reserved.
+
+## version
+version='0.1.2'
+
+PATH=${PATH}:/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+
+. /usr/local/etc/blockor.conf
+
+blockor_usage() {
+    cat << EOF
+Blockor protects Linux servers from brute-force attacks.
+Usage:
+  blockor command [args]
+Available Commands:
+  init          To initialize blockor nftables.
+  start         Start the blockord daemon.
+  stop          Stop the blockord daemon.
+  restart       Restart the blockord daemon.
+  enable        Start the blockord daemon at boot.
+  disable       Not start the blockord daemon at boot.
+  add           Add IP to blocked list.
+  remove        Remove IP from blocked list.
+  flush         Remove all entries from blocked list.
+  list          Show blocked list with the failed count.
+  status        Running or Stopped.
+Use "blockor -v|--version" for version information.
+EOF
+    exit 1
+}
+
+permission_check() {
+    if [ $(id -u) -ne 0 ]; then
+        echo "blockor(permission denied). root|doas|sudo required"
+        exit 1
+    fi
+}
+
+blockor_version() {
+    echo "blockor(${version})"
+    exit 0
+}
+
+blockor_init() {
+    nft add table ip blockor_table
+    nft add set ip blockor_table blockor_set { type ipv4_addr\; }
+    nft add chain ip blockor_table input { type filter hook input priority 0 \; }
+    nft add rule ip blockor_table input ip saddr @blockor_set drop
+    echo "blockor(ok)"
+    exit 0
+}
+
+blockor_check() {
+    blockor_conf="/usr/local/etc/blockor.conf"
+    if [ ! -r $blockor_conf ]; then
+        echo "blockor($blockor_conf not found)"
+        echo "example: /usr/local/share/examples/blockor/blockor.example.conf"
+        exit 1
+    fi
+
+    echo "blockor(ok)"
+    echo "To initialize blockor nftables:(if not done already)"
+    echo "blockor init"
+    echo ""
+    echo "To check blockor nftables:"
+    echo "nft list table blockor_table"
+    exit 0
+}
+
+blockor_start() {
+    if [ $(ps ax | awk '/libexec/ && /blockord.sh/' | grep -v awk | wc -l) -gt 0 ]; then
+        echo 'blockord(already running)'
+        exit 1
+    fi
+    systemctl start blockord
+    echo 'blockord(running)'
+}
+
+blockor_stop() {
+    systemctl stop blockord
+    echo 'blockord(stopped)'
+}
+
+blockor_add() {
+    IP=$(echo ${1} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    check_whitelisted $IP
+    if [ ! -z $IP ]; then
+        nft add element ip blockor_table blockor_set { $IP }
+    fi
+}
+
+check_whitelisted() {
+    for white_ip in $(echo $blockor_whitelist); do
+        if [ ${1} = "${white_ip}" ]; then
+            echo 'blockor(whitelisted. skipped.' $white_ip')'
+        fi
+    done
+}
+
+blockor_remove() {
+    IP=$(echo ${1} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    if [ ! -z $IP ]; then
+        nft delete element ip blockor_table blockor_set { $IP }
+        check_blockor_file
+        sed -i '/'"${IP}"'$/d' $blockor_file
+    fi
+}
+
+check_blockor_file() {
+    if [ ! -f $blockor_file ]; then
+        exit 1
+    fi
+}
+
+blockor_flush() {
+    nft flush set blockor_table blockor_set
+    check_blockor_file
+    cat /dev/null > $blockor_file
+    echo 'blockor(flushed)'
+    exit 0
+}
+
+blockor_list() {
+    echo 'Blocked IP(s):'
+    nft list set blockor_table blockor_set | grep elements | cut -d "=" -f2
+
+    check_blockor_file
+
+    echo "count  IP"
+    cat $blockor_file | sort | uniq -c | sort -nr
+    exit 0
+}
+
+blockor_status() {
+    status='stopped'
+    if [ $(ps ax | awk '/libexec/ && /blockord.sh/' | grep -v awk | wc -l) -gt 0 ]; then
+        status='running'
+    fi
+    echo 'blockord('$status'.'$(systemctl is-enabled blockord)')'
+    exit 0
+}
+
+blockor_eanble() {
+    systemctl enable blockord
+    echo 'blockord(enabled)'
+}
+
+blockor_disable() {
+    systemctl disable blockord
+    echo 'blockord(disabled)'
+}
+
+blockor_restart() {
+    blockor_stop
+    blockor_start
+    exit 0
+}
+
+is_valid_ip() {
+    IP=$(echo ${1} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+    if [ -z $IP ]; then
+        echo 'blockor(invalid IP)'
+        exit 1
+    fi
+}
+
+[ $# -lt 1 ] && usage
+
+CMD=$1
+shift
+
+case ${CMD} in
+version|-v|--version)
+    blockor_version
+    ;;
+help|-h|--help)
+    blockor_usage
+    ;;
+check|--check)
+    permission_check
+    blockor_check
+    ;;
+init|--init)
+    permission_check
+    blockor_init
+    ;;
+start|--start)
+    permission_check
+    blockor_start
+    exit 0
+    ;;
+stop|--stop)
+    permission_check
+    blockor_stop
+    exit 0
+    ;;
+restart|--restart)
+    permission_check
+    blockor_restart
+    ;;
+add|-a|--add)
+    permission_check
+    is_valid_ip $1
+    while [ ! -z $1 ]; do
+        blockor_add $1
+        shift
+    done
+    echo 'blockor(ok)'
+    exit 0
+    ;;
+remove|-r|--remove)
+    permission_check
+    is_valid_ip $1
+    while [ ! -z $1 ]; do
+        blockor_remove $1
+        shift
+    done
+    echo 'blockor(removed)'
+    exit 0
+    ;;
+flush|-f|--flush)
+    permission_check
+    blockor_flush
+    ;;
+list|-l|--list)
+    permission_check
+    blockor_list
+    ;;
+status|-s|--status)
+    permission_check
+    blockor_status
+    ;;
+enable|-e|--enable)
+    permission_check
+    blockor_eanble
+    ;;
+disable|-d|--disable)
+    permission_check
+    blockor_disable
+    ;;
+*)
+    blockor_usage
+    ;;
+esac

@@ -1,0 +1,15 @@
+#!/bin/sh
+
+# Copyright (c) 2022-2022, Muktadiur Rahman <muktadiur@gmail.com>
+# All rights reserved.
+
+[Unit]
+Description=Blockord Service
+
+[Service]
+ExecStart= /bin/nohup /usr/local/libexec/blockor/blockord.sh 2>&1 &
+
+[Install]
+WantedBy=multi-user.target
+
+
