@@ -1,21 +1,34 @@
 #!/bin/sh
 #
-# Copyright (c) 2022-2022, Muktadiur Rahman <muktadiur@gmail.com>
+# Copyright (c) 2022-2023, Muktadiur Rahman <muktadiur@gmail.com>
 # All rights reserved.
 
 . /usr/local/etc/blockor.conf
 
-if [ $(nft list tables | grep blockor_table | wc -l) -eq 0 ]; then
-	nft add table ip blockor_table
-    nft add set ip blockor_table blockor_set { type ipv4_addr\; }
-    nft add chain ip blockor_table input { type filter hook input priority 0 \; }
-    nft add rule ip blockor_table input ip saddr @blockor_set drop
-fi
+# if [ $(nft list tables | grep blockor_table | wc -l) -eq 0 ]; then
+	# nft add table ip blockor_table
+    # nft add set ip blockor_table blockor_set { type ipv4_addr\; }
+    # nft add chain ip blockor_table input { type filter hook input priority 0 \; policy drop \;}
+    # nft add rule ip blockor_table input ip saddr @blockor_set drop
+	# nft add chain ip blacklist_table input { \
+	# 	type filter hook input priority 0 \
+	# 	policy drop \
+	# 	ct state established,related accept \
+	# 	iifname "lo" accept \
+	# 	tcp dport ssh accept \
+	# 	ip saddr @blacklist_set drop \
+	# }
+# fi
 
 OS=$(uname -s | tr '[A-Z]' '[a-z]')
 
 tail -n 0 -f $auth_file | while read line
 do 
+	if [ $(nft list tables | grep blockor_table | wc -l) -eq 0 ]; then
+		echo "error: blacklist_table, blockor_set not found in /etc/nftables.conf" >> $blockor_log_file
+		continue
+	fi
+
 	echo $line | grep -E "$search_pattern" | grep -oE 'from ([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $2}' >> $blockor_file
 
 	for white_ip in $(echo $blockor_whitelist); do

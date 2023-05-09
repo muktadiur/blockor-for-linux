@@ -30,16 +30,33 @@ make uninstall
 
 #### Add blockor table on /etc/nftables.conf
 ```
+Sample:
+
 table ip blockor_table {
 	set blockor_set {
 		type ipv4_addr
 	}
 
 	chain input {
-		type filter hook input priority filter; policy accept;
+    type filter hook input priority 0;
+		policy drop;
+		ct state established,related accept
+		iifname "lo" accept
+		tcp dport ssh accept
 		ip saddr @blockor_set drop
 	}
 }
+
+policy drop: drop all incoming connections.
+
+ct state established,related accept: This allows incoming traffic that is part of an existing connection, such as responses to outgoing traffic.
+
+iifname "lo" accept: This allows traffic within the local system.
+
+tcp dport ssh accept: This allows incoming SSH connections.
+
+ip saddr @blacklist_set drop: This blocks traffic from IP addresses in the blacklist_set is dropped.
+
 ```
 
 ## Basic Commands
