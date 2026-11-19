@@ -9,6 +9,7 @@ version='0.1.2'
 PATH=${PATH}:/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 
 . /usr/local/etc/blockor.conf
+. /usr/local/libexec/blockor/blockor_lib.sh
 
 blockor_usage() {
     cat << EOF
@@ -16,7 +17,7 @@ Blockor protects Linux servers from brute-force attacks.
 Usage:
   blockor command [args]
 Available Commands:
-  init          To initialize blockor nftables.
+  init          To initialize the blockor firewall rules.
   start         Start the blockord daemon.
   stop          Stop the blockord daemon.
   restart       Restart the blockord daemon.
@@ -26,7 +27,7 @@ Available Commands:
   remove        Remove IP from blocked list.
   flush         Remove all entries from blocked list.
   list          Show blocked list with the failed count.
-  status        Running or Stopped.
+  status        Running or Stopped, with the firewall and log in use.
 Use "blockor -v|--version" for version information.
 EOF
     exit 1
@@ -39,18 +40,43 @@ permission_check() {
     fi
 }
 
+# Pick the firewall (nftables, ufw, firewalld or iptables) or stop.
+require_fw() {
+    if ! fw_setup; then
+        echo "blockor($fw_error)"
+        exit 1
+    fi
+}
+
 blockor_version() {
     echo "blockor(${version})"
     exit 0
 }
 
 blockor_init() {
-    nft add table ip blockor_table
-    nft add set ip blockor_table blockor_set { type ipv4_addr\; }
-    nft add chain ip blockor_table input { type filter hook input priority 0 \; }
-    nft add rule ip blockor_table input ip saddr @blockor_set drop
+    if ! fw_init; then
+        echo "blockor(init failed. $FW)"
+        exit 1
+    fi
     echo "blockor(ok)"
+    echo "firewall($FW)"
     exit 0
+}
+
+# Print firewall(...) and log(...) lines for status and check.
+show_backends() {
+    if fw_setup; then
+        echo "firewall($FW)"
+    else
+        echo "firewall(none. $fw_error)"
+    fi
+    if ! log_setup; then
+        echo "log(none. $log_error)"
+    elif [ "$log_from" = file ]; then
+        echo "log($auth_file)"
+    else
+        echo "log(journal)"
+    fi
 }
 
 blockor_check() {
@@ -62,11 +88,11 @@ blockor_check() {
     fi
 
     echo "blockor(ok)"
-    echo "To initialize blockor nftables:(if not done already)"
-    echo "blockor init"
-    echo ""
-    echo "To check blockor nftables:"
-    echo "nft list table blockor_table"
+    if [ -z "$blockor_whitelist" ]; then
+        echo "warning: blockor_whitelist is empty in $blockor_conf."
+        echo "Add your own IP so a few mistyped passwords cannot lock you out."
+    fi
+    show_backends
     exit 0
 }
 
@@ -84,53 +110,51 @@ blockor_stop() {
     echo 'blockord(stopped)'
 }
 
-blockor_add() {
-    IP=$(echo ${1} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
-    check_whitelisted $IP
-    if [ ! -z $IP ]; then
-        nft add element ip blockor_table blockor_set { $IP }
-    fi
+# Print $1 back if it is an IPv4 or IPv6 address, nothing otherwise.
+parse_ip() {
+    echo "$1" | grep -xE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]*:[0-9a-fA-F:]*:[0-9a-fA-F.]*'
 }
 
-check_whitelisted() {
-    for white_ip in $(echo $blockor_whitelist); do
-        if [ ${1} = "${white_ip}" ]; then
-            echo 'blockor(whitelisted. skipped.' $white_ip')'
-        fi
-    done
+blockor_add() {
+    if is_whitelisted "$1"; then
+        echo "blockor(whitelisted. skipped. $1)"
+        return
+    fi
+    fw_has "$1" || fw_add "$1"
 }
 
 blockor_remove() {
-    IP=$(echo ${1} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
-    if [ ! -z $IP ]; then
-        nft delete element ip blockor_table blockor_set { $IP }
-        check_blockor_file
-        sed -i '/'"${IP}"'$/d' $blockor_file
-    fi
-}
-
-check_blockor_file() {
-    if [ ! -f $blockor_file ]; then
-        exit 1
+    fw_remove "$1"
+    if [ -f "$blockor_file" ]; then
+        # mktemp, not a fixed name: a fixed name next to a count file in a
+        # shared directory can be planted as a symlink.
+        tmp=$(mktemp "$blockor_file.XXXXXX") || return
+        # Drop every spelling of the address (2001:db8::1, 2001:DB8:0::1).
+        awk -v drop="$1" "$norm_awk"'
+            BEGIN { drop = norm(drop) }
+            norm($1) != drop' "$blockor_file" > "$tmp"
+        cat "$tmp" > "$blockor_file"
+        rm -f "$tmp"
     fi
 }
 
 blockor_flush() {
-    nft flush set blockor_table blockor_set
-    check_blockor_file
-    cat /dev/null > $blockor_file
+    fw_flush
+    if [ -f "$blockor_file" ]; then
+        : > "$blockor_file"
+    fi
     echo 'blockor(flushed)'
     exit 0
 }
 
 blockor_list() {
     echo 'Blocked IP(s):'
-    nft list set blockor_table blockor_set | grep elements | cut -d "=" -f2
+    fw_list | sed 's/^/  /'
 
-    check_blockor_file
-
-    echo "count  IP"
-    cat $blockor_file | sort | uniq -c | sort -nr
+    if [ -f "$blockor_file" ]; then
+        echo "count  IP"
+        sort "$blockor_file" | uniq -c | sort -nr
+    fi
     exit 0
 }
 
@@ -140,6 +164,7 @@ blockor_status() {
         status='running'
     fi
     echo 'blockord('$status'.'$(systemctl is-enabled blockord)')'
+    show_backends
     exit 0
 }
 
@@ -159,15 +184,21 @@ blockor_restart() {
     exit 0
 }
 
-is_valid_ip() {
-    IP=$(echo ${1} | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
-    if [ -z $IP ]; then
+# Every argument must be an IP address.
+check_ips() {
+    if [ $# -lt 1 ]; then
         echo 'blockor(invalid IP)'
         exit 1
     fi
+    for arg in "$@"; do
+        if [ -z "$(parse_ip "$arg")" ]; then
+            echo "blockor(invalid IP. $arg)"
+            exit 1
+        fi
+    done
 }
 
-[ $# -lt 1 ] && usage
+[ $# -lt 1 ] && blockor_usage
 
 CMD=$1
 shift
@@ -185,10 +216,12 @@ check|--check)
     ;;
 init|--init)
     permission_check
+    require_fw
     blockor_init
     ;;
 start|--start)
     permission_check
+    require_fw
     blockor_start
     exit 0
     ;;
@@ -199,34 +232,41 @@ stop|--stop)
     ;;
 restart|--restart)
     permission_check
+    require_fw
     blockor_restart
     ;;
 add|-a|--add)
     permission_check
-    is_valid_ip $1
-    while [ ! -z $1 ]; do
-        blockor_add $1
-        shift
+    require_fw
+    check_ips "$@"
+    if ! fw_init >/dev/null; then
+        echo "blockor(init failed. $FW)"
+        exit 1
+    fi
+    for ip in "$@"; do
+        blockor_add "$ip"
     done
     echo 'blockor(ok)'
     exit 0
     ;;
 remove|-r|--remove)
     permission_check
-    is_valid_ip $1
-    while [ ! -z $1 ]; do
-        blockor_remove $1
-        shift
+    require_fw
+    check_ips "$@"
+    for ip in "$@"; do
+        blockor_remove "$ip"
     done
     echo 'blockor(removed)'
     exit 0
     ;;
 flush|-f|--flush)
     permission_check
+    require_fw
     blockor_flush
     ;;
 list|-l|--list)
     permission_check
+    require_fw
     blockor_list
     ;;
 status|-s|--status)

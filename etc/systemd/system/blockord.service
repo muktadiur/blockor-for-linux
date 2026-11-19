@@ -1,15 +1,17 @@
-#!/bin/sh
-
 # Copyright (c) 2022-2022, Muktadiur Rahman <muktadiur@gmail.com>
 # All rights reserved.
 
 [Unit]
 Description=Blockord Service
+# Start after nftables.service loads /etc/nftables.conf, so its
+# "flush ruleset" cannot wipe the tables blockord creates, and after
+# ufw and firewalld are up, so firewall="auto" can find them.
+After=network.target nftables.service ufw.service firewalld.service
 
 [Service]
-ExecStart= /bin/nohup /usr/local/libexec/blockor/blockord.sh 2>&1 &
+ExecStart=/usr/local/libexec/blockor/blockord.sh
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-
-
