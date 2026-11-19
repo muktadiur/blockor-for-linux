@@ -8,9 +8,9 @@ Protect Linux servers from brute-force attacks. It blocks attackers with whichev
 - One of these firewalls. Blockor uses the first one that works, in this order (see `firewall` below):
   - [nftables](https://wiki.debian.org/nftables): the `nft` command
   - ufw, when it is active (`ufw status` says `Status: active`)
-  - firewalld, when it is running
+  - firewalld, when it is running and iptables is available
   - iptables (and ip6tables for IPv6)
-- sshd logging to `/var/log/auth.log` or to the systemd journal. Blockor reads auth.log while a syslog daemon writes it, and `journalctl` otherwise (see `log_source` below).
+- sshd logging to the systemd journal or to a trusted log file. See `log_source` below.
 
 ## Installation
 ```
@@ -196,17 +196,16 @@ One failed login can produce two matching lines (Invalid user + Failed password)
 ```
 #### search_pattern
 ```
-Phrases that sshd's messages start with, separated by |
-example: search_pattern="Bad protocol version identification|..other patterns"
+Select from the supported message formats in the default search_pattern.
+For example, search_pattern="Failed password|Invalid user" counts only
+those two formats.
 
-A line counts only when it is sshd's own (sshd or sshd-session), its
-message starts with one of these phrases, and it ends with the client's
+A line counts only when it matches both the built-in list and search_pattern,
+and it ends with the client's
 "<IP> port <N>" (then only " ssh2" or " [preauth]"). That IP is counted.
 
-Add only messages where nothing the client sends comes after the IP.
-"Unable to negotiate with" and "Received disconnect from" are not safe:
-the client's key exchange offer or disconnect reason follows the IP and
-can name someone else's address to get it blocked.
+The built-in list excludes key exchange offers and disconnect reasons,
+including on upgrades that preserve an older search_pattern.
 
 Timestamps must be ISO 8601 (the journal, rsyslog on Debian 12) or
 traditional syslog ("Nov 19 00:15:24").
@@ -216,23 +215,23 @@ traditional syslog ("Nov 19 00:15:24").
 auto       the first that works, in this order (default):
            nftables, ufw (if active), firewalld (if running), iptables
 nftables   blockor_table in the ip and ip6 families, with a set of IPs
-ufw        "deny from IP" rules with the comment "blockor", put above
-           your allow rules. They show in "ufw status" and, unlike the
-           others, stay after a reboot until removed or flushed.
-firewalld  ipsets "blockor" and "blockor6" in the drop zone. Creating
-           them runs firewall-cmd --reload once.
+ufw        Tagged deny rules persist across reboot and show in ufw status.
+           Blockor also installs early drops to cover established connections.
+           Run blockor init after a UFW reload to restore early drops immediately.
+firewalld  A runtime chain in the iptables mangle table drops input before
+           firewalld can accept established connections.
+           Existing bans in Blockor's drop-zone ipsets are carried forward.
 iptables   a BLOCKOR chain in iptables and ip6tables, jumped to from
            the top of INPUT
 ```
 Run `blockor restart` after changing it.
 #### log_source
 ```
-auto     read auth_file while a syslog daemon writes it, the systemd
-         journal otherwise (default)
+auto     use the journal on systemd hosts with journalctl, or auth_file otherwise
 file     always read auth_file
-journal  always read the journal (sshd and sshd-session lines)
+journal  always use the journal
 ```
-With `auto`, a leftover auth.log on a systemd host with no rsyslog or syslog-ng running is skipped, since nothing writes to it.
+Journal mode verifies the sender's UID and executable using trusted journal fields. If you use `file`, configure your logger to accept only verified OpenSSH messages for that file. A general syslog file can include entries with tags supplied by local users.
 #### blockor_whitelist
 ```
 IP in blockor_whitelist will be excluded from blocking. Add IP with space-separated.

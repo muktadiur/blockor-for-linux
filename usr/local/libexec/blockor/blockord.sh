@@ -25,8 +25,7 @@ if ! fw_init >/dev/null; then
 	exit 1
 fi
 
-# Where sshd writes its log: auth.log while a syslog daemon writes it, the
-# journal otherwise (Debian 12 and later log only to the journal).
+# Prefer the journal, which can authenticate the process that logged a message.
 if ! log_setup; then
 	log "$log_error."
 	exit 1
@@ -46,27 +45,65 @@ fi
 if [ -z "$blockor_whitelist" ]; then
 	log 'warning: blockor_whitelist is empty. Add your own IP so you cannot lock yourself out.'
 fi
-[ -n "$log_note" ] && log "$log_note. reading the journal instead."
-log "started. reading sshd log from $log_from. blocking with $FW."
+
+# The journal is matched on _EXE, the program that logged. From OpenSSH
+# 9.8, sshd-session (and from 10.0 sshd-auth) logs every failed login, not
+# sshd, and distros install them in different places: Debian
+# /usr/lib/openssh, Fedora /usr/libexec/openssh, Arch /usr/lib/ssh,
+# openSUSE /usr/libexec/ssh. Ask sshd where its own are first ("sshd -T"
+# prints sshdsessionpath and sshdauthpath from 9.8), then try those.
+sshd_candidates() {
+	if have sshd; then
+		command -v sshd
+		sshd -T 2>/dev/null |
+			awk '$1 == "sshdsessionpath" || $1 == "sshdauthpath" { print $2 }'
+	fi
+	for dir in /usr/lib/openssh /usr/libexec/openssh /usr/lib/ssh \
+		/usr/libexec/ssh /usr/libexec /usr/local/libexec; do
+		echo "$dir/sshd-session"
+		echo "$dir/sshd-auth"
+	done
+	echo /usr/sbin/sshd /usr/bin/sshd /usr/local/sbin/sshd
+}
+
+sshd_exes=
+if [ "$log_from" = journal ]; then
+	for exe in $(sshd_candidates); do
+		if [ -f "$exe" ] && [ -x "$exe" ]; then
+			case " $sshd_exes " in
+			*" $exe "*) ;;
+			*) sshd_exes="${sshd_exes:+$sshd_exes }$exe" ;;
+			esac
+		fi
+	done
+	if [ -z "$sshd_exes" ]; then
+		log 'could not find an OpenSSH executable to match in the journal. install OpenSSH or set log_source="file", then restart blockord.'
+		# 78 (EX_CONFIG) is in RestartPreventExitStatus in blockord.service:
+		# restarting every 5 seconds would not find it either, and would
+		# add this line to the log each time.
+		exit 78
+	fi
+	log "started. reading sshd log from the journal ($sshd_exes). blocking with $FW."
+else
+	log "started. reading sshd log from $auth_file. blocking with $FW."
+fi
 
 follow_log() {
 	if [ "$log_from" = file ]; then
 		# -F, not -f: keep following auth.log after logrotate replaces it.
 		tail -n 0 -F "$auth_file" 2>/dev/null
 	else
-		# No journalctl -t sshd: systemd 256 and later drop most of the
-		# first burst of entries whose -t value the journal file has not
-		# seen yet, such as the first sshd-session lines after each journal
-		# rotation. sshd's lines are picked out by line_re below instead.
-		# short-iso prints "<time> <host> <identifier>[<pid>]: " in every
-		# locale.
-		journalctl -f -n 0 -o short-iso
+		# journalctl turns each executable path into an _EXE= match on its
+		# canonical path. Matches on one field are ORed, on different
+		# fields ANDed: _UID=0 and any of the executables.
+		# shellcheck disable=SC2086 # one argument per executable
+		journalctl --system -f -n 0 -o short-iso _UID=0 $sshd_exes
 	fi
 }
 
 block_ip() {
 	# Check and repair blockor's rules first: a firewall reload, "nft flush
-	# ruleset" or a deleted INPUT jump or drop zone binding leaves IPs
+	# ruleset" or a deleted INPUT jump leaves IPs
 	# listed but not dropped, and an IP already listed is only blocked if
 	# the rules around it are there.
 	if ! fw_init >/dev/null; then
@@ -89,17 +126,17 @@ block_ip() {
 # ... Their offer: <text>"), the disconnect reason ("Received disconnect
 # from ...: <text>"). A line counts only if:
 #
-# 1. It is sshd's own line and its message STARTS with a search_pattern
-#    phrase. The prefix before the message is matched exactly, for ISO
-#    8601 timestamps (journalctl -o short-iso, rsyslog on Debian 12) and
-#    traditional ones ("Nov 19 00:15:24"), so a phrase inside the client's
-#    text never counts.
+# 1. Its message starts with a phrase from the built-in allowlist and
+#    matches search_pattern. Match and strip the timestamp, host and SSH
+#    tag first, so a phrase inside the client's text never counts.
 # 2. The address is the "<IP> port <N>" that ENDS the line, before sshd's
 #    own " ssh2" or " [preauth]". In the default patterns' messages the
 #    client's text (username, banner) only comes before it, so
 #    "Invalid user x from 1.2.3.4 port 22 from <client> port 5555" counts
 #    <client>.
-line_re="^([0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+|[A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2}) [^ ]+ (sshd|sshd-session)(\\[[0-9]+\\])?: ($search_pattern)"
+log_prefix='^([0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+|[A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2}) [^ ]+ sshd(-session|-auth)?(\[[0-9]+\])?: '
+safe_messages='Failed password for |Invalid user |Bad protocol version identification |Disconnected from authenticating user root '
+search_pattern=${search_pattern:-$safe_messages}
 ip_pattern='([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9a-fA-F]*:[0-9a-fA-F:]*:[0-9a-fA-F.]*)'
 addr_sed="s/.* $ip_pattern port [0-9]+( ssh2)?( \\[preauth\\])?\$/\\1/p"
 
@@ -110,7 +147,9 @@ addr_sed="s/.* $ip_pattern port [0-9]+( ssh2)?( \\[preauth\\])?\$/\\1/p"
 whitelist=" $(canon_ips $blockor_whitelist | tr '\n' ' ')"
 
 follow_log \
-	| grep --line-buffered -E "$line_re" \
+	| sed -n -E -u "s/$log_prefix//p" \
+	| grep --line-buffered -E "^($safe_messages)" \
+	| grep --line-buffered -E "^($search_pattern)" \
 	| sed -n -E -u "$addr_sed" \
 	| while IFS= read -r ip; do
 		case $whitelist in

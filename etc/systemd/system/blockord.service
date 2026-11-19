@@ -12,6 +12,9 @@ After=network.target nftables.service ufw.service firewalld.service
 ExecStart=/usr/local/libexec/blockor/blockord.sh
 Restart=always
 RestartSec=5
+# blockord exits 78 (EX_CONFIG) when it cannot find sshd to read the
+# journal for. Restarting would not change that, so stay stopped.
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=multi-user.target

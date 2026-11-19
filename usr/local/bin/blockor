@@ -124,7 +124,7 @@ blockor_add() {
 }
 
 blockor_remove() {
-    fw_remove "$1"
+    fw_remove "$1" || return 1
     if [ -f "$blockor_file" ]; then
         # mktemp, not a fixed name: a fixed name next to a count file in a
         # shared directory can be planted as a symlink.
@@ -139,7 +139,10 @@ blockor_remove() {
 }
 
 blockor_flush() {
-    fw_flush
+    if ! fw_flush; then
+        echo "blockor(flush failed. $FW)" >&2
+        exit 1
+    fi
     if [ -f "$blockor_file" ]; then
         : > "$blockor_file"
     fi
@@ -243,9 +246,14 @@ add|-a|--add)
         echo "blockor(init failed. $FW)"
         exit 1
     fi
+    failed=0
     for ip in "$@"; do
-        blockor_add "$ip"
+        if ! blockor_add "$ip"; then
+            echo "blockor(add failed. $ip)" >&2
+            failed=1
+        fi
     done
+    [ "$failed" -eq 0 ] || exit 1
     echo 'blockor(ok)'
     exit 0
     ;;
@@ -253,9 +261,14 @@ remove|-r|--remove)
     permission_check
     require_fw
     check_ips "$@"
+    failed=0
     for ip in "$@"; do
-        blockor_remove "$ip"
+        if ! blockor_remove "$ip"; then
+            echo "blockor(remove failed. $ip)" >&2
+            failed=1
+        fi
     done
+    [ "$failed" -eq 0 ] || exit 1
     echo 'blockor(removed)'
     exit 0
     ;;

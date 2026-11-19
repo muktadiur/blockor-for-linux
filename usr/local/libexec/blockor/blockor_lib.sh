@@ -180,7 +180,11 @@ nftables_add() {
 	nft add element "$(ip_family "$1")" "$blockor_table" "$blockor_set" "{ $1 }"
 }
 
+# An IP that is not in the set is already removed, not an error: blockor
+# remove must still clear the counts of an IP that a reboot or "nft flush
+# ruleset" unblocked, or its next failed login blocks it again.
 nftables_remove() {
+	nftables_has "$1" || return 0
 	nft delete element "$(ip_family "$1")" "$blockor_table" "$blockor_set" "{ $1 }"
 }
 
@@ -208,128 +212,173 @@ nftables_list() {
 	done
 }
 
-# ufw: only when active, otherwise its rules do nothing. Rules carry the
-# comment "blockor" so they can be told apart from the admin's own.
+# UFW stores the persistent deny in its user chain. The matching runtime
+# rule must run before ufw-before-input accepts established connections.
+ufw_chain=BLOCKOR-UFW
+
 ufw_usable() {
-	have ufw && ufw status 2>/dev/null | grep -q '^Status: active'
-}
-
-# ufw's rules stay in place when ufw is disabled but drop nothing then.
-ufw_init() {
-	ufw_usable
-}
-
-ufw_add() {
-	# The deny has to sit above the rule that allows ssh, so prepend it
-	# (ufw 0.35 or later). No fallback to appending: an appended deny sits
-	# below the ssh allow and blocks nothing, so fail and let it be logged.
-	ufw prepend deny from "$1" comment "$blockor_tag" >/dev/null
-}
-
-ufw_remove() {
-	ufw delete deny from "$1" >/dev/null
-}
-
-ufw_has() {
-	ufw_list | ip_listed "$1"
-}
-
-ufw_flush() {
-	for ip in $(ufw_list); do
-		ufw_remove "$ip"
-	done
+	have ufw && have iptables && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'
 }
 
 ufw_list() {
-	ufw status | grep -E "# ${blockor_tag}[[:space:]]*\$" |
-		grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]*:[0-9a-fA-F:]*:[0-9a-fA-F.]*'
+	ufw_status=$(LC_ALL=C ufw status) || return 1
+	# Plain "ufw status" prints incoming rules as "DENY"; only the verbose
+	# and numbered forms print "DENY IN". Accept both.
+	printf '%s\n' "$ufw_status" | awk -v tag="$blockor_tag" '
+		$1 == "Anywhere" {
+			i = $2 == "(v6)" ? 3 : 2
+			if ($i != "DENY") next
+			j = $(i+1) == "IN" ? i+2 : i+1
+			if (NF == j+2 && $j ~ /^[0-9a-fA-F:.]+$/ &&
+			    $(j+1) == "#" && $(j+2) == tag)
+				print $j
+		}'
 }
 
-# firewalld: ipsets blockor (IPv4) and blockor6 (IPv6) bound to the drop
-# zone. Creating them is a permanent change, so the first init runs one
-# firewall-cmd --reload. Entries are runtime only, like the nftables sets.
-firewalld_usable() {
-	have firewall-cmd && firewall-cmd --state >/dev/null 2>&1
-}
-
-firewalld_ipset() {
+ufw_init_family() {
 	case $1 in
-	*:*) echo "${blockor_tag}6" ;;
-	*) echo "$blockor_tag" ;;
+	ip) before=ufw-before-input ;;
+	ip6) before=ufw6-before-input ;;
 	esac
-}
-
-# firewalld_has_ipset name [--permanent]
-firewalld_has_ipset() {
-	name=$1
-	shift
-	firewall-cmd "$@" --get-ipsets | tr ' ' '\n' | grep -qxF -- "$name"
-}
-
-# firewalld_bound name [--permanent]: the ipset is a source of the drop
-# zone. An ipset that is not bound holds entries but blocks nothing.
-firewalld_bound() {
-	name=$1
-	shift
-	firewall-cmd "$@" --zone=drop --query-source="ipset:$name" >/dev/null 2>&1
-}
-
-# Checks each ipset and its drop zone binding, in the saved config and in
-# the running one, and repairs what is missing. Reloads only when the saved
-# config changed or the running one lacks an ipset, since a reload empties
-# the ipsets.
-firewalld_init() {
-	reload=
-	for spec in "$blockor_tag inet" "${blockor_tag}6 inet6"; do
-		# shellcheck disable=SC2086 # split "name family"
-		set -- $spec
-		firewalld_bound "$1" --permanent && continue
-		if ! firewalld_has_ipset "$1" --permanent; then
-			firewall-cmd --permanent --new-ipset="$1" --type=hash:ip --option=family="$2" >/dev/null ||
-				return 1
-		fi
-		firewall-cmd --permanent --zone=drop --add-source="ipset:$1" >/dev/null || return 1
-		reload=1
+	init_input_jump "$1" "$before" "$ufw_chain" || return 1
+	runtime=$(ipt "$1" -S "$ufw_chain") || return 1
+	# Compare the saved and runtime lists with normalized IPv6 addresses.
+	missing=$(printf '%s\n' "$runtime" "$ufw_saved" | awk -v family="$1" "$norm_awk"'
+		NF == 6 && $1 == "-A" && $3 == "-s" && $5 == "-j" && $6 == "DROP" {
+			sub("/(32|128)$", "", $4); present[norm($4)] = 1
+		}
+		NF == 1 && $1 !~ /^-/ && (index($1, ":") > 0) == (family == "ip6") &&
+		    !present[norm($1)] { print $1 }') || return 1
+	for address in $missing; do
+		ipt "$1" -A "$ufw_chain" -s "$address" -j DROP || return 1
 	done
-	unbound=
-	for name in "$blockor_tag" "${blockor_tag}6"; do
-		firewalld_bound "$name" && continue
-		firewalld_has_ipset "$name" || reload=1
-		unbound="$unbound $name"
-	done
-	if [ -n "$reload" ]; then
-		firewall-cmd --reload >/dev/null || return 1
-		unbound="$blockor_tag ${blockor_tag}6"
+}
+
+ufw_init() {
+	ufw_usable || return 1
+	ufw_saved=$(ufw_list) || return 1
+	ufw_init_family ip || return 1
+	if have ip6tables && ipt ip6 -S ufw6-before-input >/dev/null 2>&1; then
+		ufw_init_family ip6 || return 1
 	fi
-	# A binding removed only in the running config stays gone until the
-	# next reload; put it back without one.
-	for name in $unbound; do
-		firewalld_bound "$name" ||
-			firewall-cmd --zone=drop --add-source="ipset:$name" >/dev/null || return 1
+}
+
+ufw_has() {
+	ipt "$(ip_family "$1")" -C "$ufw_chain" -s "$1" -j DROP 2>/dev/null
+}
+
+ufw_add() {
+	# Reject a family where we cannot enforce the early drop.
+	case $1 in
+	*:*) ipt ip6 -C ufw6-before-input -j "$ufw_chain" || return 1 ;;
+	esac
+	LC_ALL=C ufw prepend deny from "$1" comment "$blockor_tag" >/dev/null || return 1
+	# UFW may successfully skip a duplicate administrator rule.
+	saved=$(ufw_list) || return 1
+	if ! printf '%s\n' "$saved" | ip_listed "$1"; then
+		echo "blockor(could not create an owned UFW rule for $1)" >&2
+		return 1
+	fi
+	ufw_saved=$saved ufw_init_family "$(ip_family "$1")"
+}
+
+ufw_remove() {
+	saved=$(ufw_list) || return 1
+	# Delete by rule specification so another rule's index cannot shift
+	# into place. UFW does not use comments when matching a deletion.
+	if printf '%s\n' "$saved" | ip_listed "$1"; then
+		LC_ALL=C ufw delete deny from "$1" >/dev/null || return 1
+	fi
+	while ufw_has "$1"; do
+		ipt "$(ip_family "$1")" -D "$ufw_chain" -s "$1" -j DROP || return 1
 	done
 }
 
-firewalld_add() {
-	firewall-cmd --ipset="$(firewalld_ipset "$1")" --add-entry="$1" >/dev/null
+ufw_flush() {
+	saved=$(ufw_list) || return 1
+	for address in $saved; do
+		ufw_remove "$address" || return 1
+	done
+	for family in ip ip6; do
+		if ipt "$family" -S "$ufw_chain" >/dev/null 2>&1; then
+			ipt "$family" -F "$ufw_chain" || return 1
+		fi
+	done
 }
 
-firewalld_remove() {
-	firewall-cmd --ipset="$(firewalld_ipset "$1")" --remove-entry="$1" >/dev/null
+# A separate mangle INPUT chain drops packets before firewalld accepts
+# established connections. The direct API can flush unrelated iptables
+# rules on its first use, so manage only our chain through iptables.
+firewalld_chain=BLOCKOR-FWD
+
+firewalld_usable() {
+	have firewall-cmd && have iptables && firewall-cmd --state >/dev/null 2>&1 &&
+		ipt ip -t mangle -S INPUT >/dev/null 2>&1
+}
+
+firewalld_rule() {
+	ipt "$(ip_family "$2")" -t mangle "$1" "$firewalld_chain" -s "$2" -j DROP
 }
 
 firewalld_has() {
-	firewall-cmd --ipset="$(firewalld_ipset "$1")" --query-entry="$1" >/dev/null 2>&1
+	firewalld_rule -C "$1" >/dev/null 2>&1
 }
 
-firewalld_flush() {
-	for ip in $(firewalld_list); do
-		firewalld_remove "$ip"
+firewalld_add() {
+	firewalld_rule -A "$1"
+}
+
+firewalld_remove() {
+	while firewalld_has "$1"; do
+		firewalld_rule -D "$1" || return 1
+	done
+	# Also clear any ban left by an older Blockor.
+	case $1 in
+	*:*) old_set=${blockor_tag}6 ;;
+	*) old_set=$blockor_tag ;;
+	esac
+	if firewall-cmd --zone=drop --query-source="ipset:$old_set" >/dev/null 2>&1 &&
+		firewall-cmd --ipset="$old_set" --query-entry="$1" >/dev/null 2>&1; then
+		firewall-cmd --ipset="$old_set" --remove-entry="$1" >/dev/null || return 1
+	fi
+}
+
+firewalld_legacy_list() {
+	for old_set in "$blockor_tag" "${blockor_tag}6"; do
+		if firewall-cmd --zone=drop --query-source="ipset:$old_set" >/dev/null 2>&1; then
+			firewall-cmd --ipset="$old_set" --get-entries || return 1
+		fi
+	done
+}
+
+firewalld_init() {
+	firewalld_usable || return 1
+	init_input_jump ip INPUT "$firewalld_chain" mangle || return 1
+	if have ip6tables && ipt ip6 -t mangle -S INPUT >/dev/null 2>&1; then
+		init_input_jump ip6 INPUT "$firewalld_chain" mangle || return 1
+	fi
+	legacy=$(firewalld_legacy_list) || return 1
+	for address in $legacy; do
+		firewalld_has "$address" || firewalld_add "$address" || return 1
 	done
 }
 
 firewalld_list() {
-	firewall-cmd --ipset="$blockor_tag" --get-entries 2>/dev/null
-	firewall-cmd --ipset="${blockor_tag}6" --get-entries 2>/dev/null
+	rules=$(ipt_list_drops mangle "$firewalld_chain")
+	legacy=$(firewalld_legacy_list) || return 1
+	printf '%s\n' "$rules" "$legacy" | awk "$norm_awk"'{
+		for (i = 1; i <= NF; i++) {
+			address = canon($i)
+			if (!seen[address]++) print address
+		}
+	}'
+}
+
+firewalld_flush() {
+	rules=$(firewalld_list) || return 1
+	for address in $rules; do
+		firewalld_remove "$address" || return 1
+	done
 }
 
 # iptables: a BLOCKOR chain in iptables, and in ip6tables for IPv6.
@@ -348,20 +397,24 @@ iptables_usable() {
 	have iptables && ipt ip -n -L INPUT >/dev/null 2>&1
 }
 
-iptables_init_family() {
-	ipt "$1" -n -L "$blockor_chain" >/dev/null 2>&1 ||
-		ipt "$1" -N "$blockor_chain" || return 1
-	# Jump to the chain from the top of INPUT, so an ACCEPT rule that
-	# another tool adds cannot let a blocked IP through first.
-	if [ "$(ipt "$1" -S INPUT | sed -n 2p)" != "-A INPUT -j $blockor_chain" ]; then
-		while ipt "$1" -D INPUT -j "$blockor_chain" 2>/dev/null; do :; done
-		ipt "$1" -I INPUT 1 -j "$blockor_chain"
+# Link our chain before any early ACCEPT in the owning input chain.
+# init_input_jump family parent child [table]
+init_input_jump() {
+	table=${4:-filter}
+	ipt "$1" -t "$table" -S "$3" >/dev/null 2>&1 || {
+		ipt "$1" -t "$table" -N "$3" || ipt "$1" -t "$table" -S "$3" >/dev/null || return 1
+	}
+	parent_rules=$(ipt "$1" -t "$table" -S "$2") || return 1
+	first_rule=$(printf '%s\n' "$parent_rules" | awk '/^-A / {print; exit}')
+	if [ "$first_rule" != "-A $2 -j $3" ]; then
+		while ipt "$1" -t "$table" -D "$2" -j "$3" 2>/dev/null; do :; done
+		ipt "$1" -t "$table" -I "$2" 1 -j "$3"
 	fi
 }
 
 iptables_init() {
-	iptables_init_family ip || return 1
-	{ have ip6tables && iptables_init_family ip6; } ||
+	init_input_jump ip INPUT "$blockor_chain" || return 1
+	{ have ip6tables && init_input_jump ip6 INPUT "$blockor_chain"; } ||
 		echo "blockor(ip6tables chain not created. blocking IPv4 only)"
 	return 0
 }
@@ -370,8 +423,11 @@ iptables_add() {
 	ipt "$(ip_family "$1")" -A "$blockor_chain" -s "$1" -j DROP
 }
 
+# Like nftables_remove, succeeds when the IP has no rule.
 iptables_remove() {
-	ipt "$(ip_family "$1")" -D "$blockor_chain" -s "$1" -j DROP
+	while iptables_has "$1"; do
+		ipt "$(ip_family "$1")" -D "$blockor_chain" -s "$1" -j DROP || return 1
+	done
 }
 
 iptables_has() {
@@ -384,11 +440,17 @@ iptables_flush() {
 	return 0
 }
 
-iptables_list() {
+ipt_list_drops() {
 	for family in ip ip6; do
-		ipt "$family" -S "$blockor_chain" 2>/dev/null |
-			awk '$1 == "-A" && $3 == "-s" { sub("/(32|128)$", "", $4); print $4 }'
+		ipt "$family" -t "$1" -S "$2" 2>/dev/null |
+			awk 'NF == 6 && $1 == "-A" && $3 == "-s" && $5 == "-j" && $6 == "DROP" {
+				sub("/(32|128)$", "", $4); print $4
+			}'
 	done
+}
+
+iptables_list() {
+	ipt_list_drops filter "$blockor_chain"
 }
 
 #
@@ -450,32 +512,18 @@ fw_list() {
 }
 
 #
-# Log source. log_source="auto" reads auth_file while a syslog daemon writes
-# it, and the systemd journal otherwise (Debian 12 and later have no
-# auth.log unless rsyslog is installed).
+# Log source. Prefer the local systemd journal for its trusted sender metadata.
 #
 
-# True when systemd runs with no syslog daemon, so auth_file, if it exists,
-# is left over and no longer grows. sshd's lines are in the journal then.
-syslog_stopped() {
-	[ -d /run/systemd/system ] && have journalctl &&
-		! systemctl is-active --quiet syslog.service rsyslog.service syslog-ng.service
-}
-
-# Sets log_from to file or journal, and log_note to why auto skipped
-# auth_file when it exists. Sets log_error and returns 1 on a bad setting.
+# Sets log_from to file or journal. Sets log_error on a bad setting.
 log_setup() {
 	log_from=$log_source
-	log_note=
 	log_error=
 	if [ "$log_from" = auto ]; then
-		if [ ! -e "$auth_file" ]; then
+		if [ -d /run/systemd/system ] && have journalctl; then
 			log_from=journal
-		elif syslog_stopped; then
-			log_from=journal
-			log_note="$auth_file exists but no syslog daemon is writing it"
 		else
-			log_from=file
+			log_from='file'
 		fi
 	fi
 	case $log_from in
